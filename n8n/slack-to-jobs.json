@@ -1,0 +1,44 @@
+{
+  "name": "Slack message → FastAPI /jobs",
+  "nodes": [
+    {
+      "id": "d903efda-45ef-4518-ba20-f3206d7e202a",
+      "name": "Slack Trigger",
+      "type": "n8n-nodes-base.slackTrigger",
+      "typeVersion": 1,
+      "position": [0, 0],
+      "webhookId": "dab0fa5e-fbf1-4ada-91b8-a5dd7a85d0c6",
+      "parameters": {
+        "trigger": ["message"],
+        "watchWorkspace": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "360cec65-a60e-40c0-a38b-299f593cf75b",
+      "name": "POST /jobs",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [260, 0],
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "parameters": {
+        "method": "POST",
+        "url": "http://api:8000/jobs",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "Slack Trigger": {
+      "main": [[{ "node": "POST /jobs", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": { "executionOrder": "v1" }
+}

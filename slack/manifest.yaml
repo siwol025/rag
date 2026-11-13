@@ -1,0 +1,18 @@
+display_information:
+  name: Slack RAG
+features:
+  bot_user:
+    display_name: slack-rag
+    always_online: false
+oauth_config:
+  scopes:
+    bot:
+      - channels:history        # 공개 채널 message.channels 수신(가정 A2)
+settings:
+  event_subscriptions:          # 처음 만들 때는 이 블록을 빼고 만든다(7장 E3, E6)
+    request_url: https://<터널 도메인>/webhook/<webhookId>/webhook
+    bot_events:
+      - message.channels
+  org_deploy_enabled: false
+  socket_mode_enabled: false
+  token_rotation_enabled: false # n8n 문서: 로테이션을 켜면 12시간마다 토큰 만료, 한번 켜면 못 끔

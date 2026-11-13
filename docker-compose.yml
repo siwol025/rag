@@ -1,0 +1,44 @@
+services:
+  postgres:
+    image: postgres:18.6-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "127.0.0.1:5432:5432"     # 로컬 uv run, psql 확인용
+    volumes:
+      - postgres_data:/var/lib/postgresql   # 18부터 이 경로(…/data 아님)
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  n8n:
+    image: n8nio/n8n:2.47.4
+    environment:
+      WEBHOOK_URL: ${N8N_WEBHOOK_URL}         # 터널 주소. Slack Trigger의 Production URL에 쓰임
+      N8N_PROXY_HOPS: "1"                     # 터널(프록시) 1단 뒤에 있음
+      N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS: "true"
+    ports:
+      - "127.0.0.1:5678:5678"     # 터널이 이 포트로 연결
+    volumes:
+      - n8n_data:/home/node/.n8n  # 워크플로, 자격 증명, 암호화 키(SQLite)
+    depends_on:
+      - api
+
+volumes:
+  postgres_data:
+  n8n_data:

@@ -1,0 +1,25 @@
+[project]
+name = "slack-rag"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.162.5",
+    "pydantic>=2.14.3",
+    "pydantic-settings>=2.16.2",
+    "psycopg[binary,pool]>=3.3.8",
+    "uvicorn>=0.54.0",
+]
+
+[dependency-groups]
+dev = [
+    "httpx2>=2.16.0",          # Starlette 1.10 TestClient가 요구(httpx 아님)
+    "pytest>=9.2.0",
+    "testcontainers>=4.15.0",  # postgres 모듈은 extra 없이 포함
+]
+
+[build-system]
+requires = ["uv_build>=0.13.7,<0.14"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
