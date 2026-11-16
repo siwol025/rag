@@ -3,9 +3,11 @@ import secrets
 from contextlib import asynccontextmanager
 from typing import Annotated
 
+from anyio import from_thread
 from fastapi import Depends, FastAPI, Header, HTTPException, Response, status
 from psycopg_pool import ConnectionPool
 
+from slack_rag import job_queue
 from slack_rag.config import Settings
 from slack_rag.db import apply_schema, create_job
 from slack_rag.filters import ignore_reason
@@ -25,7 +27,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         pool.open(wait=True)  # DB에 못 붙으면 기본 30초 뒤 시작 실패
         with pool.connection() as conn:
             apply_schema(conn)
+        app.state.queue = await job_queue.connect(settings.redis_url)  # 못 붙으면 약 5초 재시도 뒤 시작 실패
         yield
+        await app.state.queue.aclose()
         pool.close()
 
     def require_api_key(x_api_key: Annotated[str | None, Header()] = None) -> None:
@@ -45,8 +49,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             response.status_code = status.HTTP_200_OK
             return {"status": "ignored", "reason": reason}
 
-        with pool.connection() as conn:  # 블록이 끝날 때 커밋 → 그 뒤에 응답
-            job_id, created = create_job(
+        with pool.connection() as conn:  # 블록이 끝날 때 커밋 → 그 뒤에 적재·응답
+            job_id, created, job_status = create_job(
                 conn,
                 channel_id=event.channel,
                 message_ts=event.ts,
@@ -54,7 +58,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 message_text=event.text,
             )
         result = "accepted" if created else "duplicate"
-        logger.info(f"job_{result}", extra={"fields": {**ref, "job_id": job_id}})
+        fields = {**ref, "job_id": job_id}
+        enqueued = False
+        if job_status == "queued":  # 새 작업이거나, 앞선 요청이 적재에 실패했을 수 있는 작업(3.1)
+            try:
+                # 이 함수는 스레드풀에서 돈다. 비동기 적재는 이벤트 루프에서 돌리고 끝까지 기다린다(3.3)
+                enqueued = from_thread.run(job_queue.enqueue, app.state.queue, job_id)
+            except job_queue.QueueUnavailable as exc:
+                logger.warning("job_enqueue_failed", extra={"fields": {**fields, "error": str(exc)}})
+                raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, detail="queue unavailable") from exc
+        logger.info(f"job_{result}", extra={"fields": {**fields, "enqueued": enqueued}})
         return {"status": result, "job_id": str(job_id)}
 
     return app

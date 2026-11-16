@@ -15,16 +15,46 @@ services:
       timeout: 3s
       retries: 10
 
+  redis:
+    image: redis:8.10.3-alpine
+    command: ["redis-server", "--appendonly", "yes"]   # 재시작해도 대기 중인 작업이 남게(AOF)
+    ports:
+      - "127.0.0.1:6380:6379"     # 로컬 uv run, redis-cli 확인용(호스트 6379는 다른 프로젝트가 사용 중)
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   api:
     build: .
     env_file: .env
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: .
+    command: ["python", "-m", "slack_rag.worker"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      api:
+        condition: service_started   # 스키마는 api가 시작하며 적용(워커가 먼저 뜨면 실패 후 재시작)
+      redis:
+        condition: service_healthy
+    restart: unless-stopped          # Redis가 끊기면 워커가 종료됨 → 다시 떠서 대기 작업을 보정(3.6)
 
   n8n:
     image: n8nio/n8n:2.47.4
@@ -41,4 +71,5 @@ services:
 
 volumes:
   postgres_data:
+  redis_data:
   n8n_data:

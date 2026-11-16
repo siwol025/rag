@@ -8,10 +8,12 @@ os.environ.setdefault("TESTCONTAINERS_RYUK_DISABLED", "true")
 import psycopg  # noqa: E402
 import pytest  # noqa: E402
 from testcontainers.community.postgres import PostgresContainer  # noqa: E402
+from testcontainers.community.redis import RedisContainer  # noqa: E402
 
 from slack_rag.db import apply_schema  # noqa: E402
 
 POSTGRES_IMAGE = "postgres:18.6-alpine"  # docker-compose.yml과 같은 이미지
+REDIS_IMAGE = "redis:8.10.3-alpine"  # docker-compose.yml과 같은 이미지
 
 
 @pytest.fixture
@@ -44,3 +46,39 @@ def conn(database_url):
     with psycopg.connect(database_url, autocommit=True) as conn:
         conn.execute("TRUNCATE jobs")
         yield conn
+
+
+@pytest.fixture(scope="session")
+def anyio_backend():
+    return "asyncio"  # arq와 psycopg 비동기 풀은 asyncio에서 돈다
+
+
+@pytest.fixture
+async def aconn(database_url, conn):  # conn이 jobs를 비움
+    async with await psycopg.AsyncConnection.connect(database_url, autocommit=True) as aconn:
+        yield aconn
+
+
+def redis_url_of(container: RedisContainer) -> str:
+    return f"redis://{container.get_container_host_ip()}:{container.get_exposed_port(6379)}/0"
+
+
+@pytest.fixture(scope="session")
+def redis_container():
+    with RedisContainer(REDIS_IMAGE) as container:
+        yield container
+
+
+@pytest.fixture
+def redis_url(redis_container):
+    client = redis_container.get_client()
+    client.flushdb()
+    client.close()
+    return redis_url_of(redis_container)
+
+
+@pytest.fixture
+def stoppable_redis():
+    """테스트 중에 멈출 Redis. 세션 Redis와 따로 띄운다. (컨테이너, URL)."""
+    with RedisContainer(REDIS_IMAGE) as container:
+        yield container, redis_url_of(container)

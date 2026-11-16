@@ -1,9 +1,11 @@
 import logging
 
 import pytest
+from arq.constants import default_queue_name
 from fastapi.testclient import TestClient
 
 from slack_rag.config import Settings
+from slack_rag.db import create_job
 from slack_rag.main import create_app
 
 API_KEY = "test-api-key"
@@ -11,10 +13,11 @@ AUTH = {"X-API-Key": API_KEY}
 
 
 @pytest.fixture
-def client(database_url, conn):  # conn이 jobs를 비움
+def client(database_url, redis_url, conn):  # conn이 jobs를, redis_url이 Redis를 비움
     settings = Settings(
         _env_file=None,
         database_url=database_url,
+        redis_url=redis_url,
         jobs_api_key=API_KEY,
         slack_target_channel_ids={"C0TARGET01"},
     )
@@ -79,3 +82,64 @@ def test_accepted_job_is_logged_with_its_job_id(client, make_event, caplog):
     assert any(
         str(f.get("job_id")) == job_id and f.get("message_ts") == "1794381600.000100" for f in logged
     )
+
+
+def arq_queue_ids(redis_container) -> list[str]:
+    """arq 기본 큐(정렬 집합)에 있는 작업 ID."""
+    client = redis_container.get_client()
+    try:
+        return [member.decode() for member in client.zrange(default_queue_name, 0, -1)]
+    finally:
+        client.close()
+
+
+def save_job(conn, event) -> str:
+    """앞선 요청이 DB 저장 뒤 적재에 실패(503)한 상황을 만든다."""
+    job_id, _, _ = create_job(
+        conn,
+        channel_id=event["channel"],
+        message_ts=event["ts"],
+        user_id=event["user"],
+        message_text=event["text"],
+    )
+    return str(job_id)
+
+
+def test_new_job_is_enqueued_by_its_job_id(client, redis_container, make_event):
+    job_id = client.post("/jobs", json=make_event(), headers=AUTH).json()["job_id"]
+    assert arq_queue_ids(redis_container) == [job_id]
+
+
+def test_retry_of_saved_but_not_enqueued_job_enqueues_it(client, conn, redis_container, make_event):
+    job_id = save_job(conn, make_event())
+    res = client.post("/jobs", json=make_event(), headers=AUTH)  # n8n 재시도
+    assert res.status_code == 202
+    assert res.json() == {"status": "duplicate", "job_id": job_id}
+    assert arq_queue_ids(redis_container) == [job_id]
+
+
+@pytest.mark.parametrize("job_status", ["running", "done", "failed"])
+def test_duplicate_of_started_job_is_not_enqueued(client, conn, redis_container, make_event, job_status):
+    job_id = save_job(conn, make_event())
+    conn.execute("UPDATE jobs SET status = %s WHERE id = %s", (job_status, job_id))
+    res = client.post("/jobs", json=make_event(), headers=AUTH)
+    assert res.status_code == 202
+    assert res.json() == {"status": "duplicate", "job_id": job_id}
+    assert arq_queue_ids(redis_container) == []
+
+
+def test_returns_503_and_keeps_job_queued_when_queue_is_down(database_url, conn, stoppable_redis, make_event):
+    container, redis_url = stoppable_redis
+    settings = Settings(
+        _env_file=None,
+        database_url=database_url,
+        redis_url=redis_url,
+        jobs_api_key=API_KEY,
+        slack_target_channel_ids={"C0TARGET01"},
+    )
+    with TestClient(create_app(settings)) as client:
+        container.get_wrapped_container().stop()  # 앱이 뜬 뒤 Redis 중단
+        res = client.post("/jobs", json=make_event(), headers=AUTH)
+    assert res.status_code == 503
+    assert res.json() == {"detail": "queue unavailable"}
+    assert conn.execute("SELECT status FROM jobs").fetchall() == [("queued",)]
