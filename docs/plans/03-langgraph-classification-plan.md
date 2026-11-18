@@ -1102,9 +1102,9 @@ import psycopg
 
 
 def test_app_start_creates_checkpoint_and_usage_tables_in_fresh_database(database_url, redis_url, conn):
-    conn.execute("DROP DATABASE IF EXISTS f3_fresh WITH (FORCE)")
-    conn.execute("CREATE DATABASE f3_fresh")
-    fresh_url = database_url.rsplit("/", 1)[0] + "/f3_fresh"
+    conn.execute("DROP DATABASE IF EXISTS fresh_db WITH (FORCE)")
+    conn.execute("CREATE DATABASE fresh_db")
+    fresh_url = database_url.rsplit("/", 1)[0] + "/fresh_db"
     settings = Settings(
         _env_file=None,
         database_url=fresh_url,
@@ -1121,7 +1121,7 @@ def test_app_start_creates_checkpoint_and_usage_tables_in_fresh_database(databas
             " WHERE tablename IN ('checkpoints', 'checkpoint_blobs', 'checkpoint_writes', 'llm_usage')"
         ).fetchone()[0]
         fresh.execute("SELECT request_type, service, category FROM jobs LIMIT 0")  # 분류 컬럼이 있어야 함
-    conn.execute("DROP DATABASE f3_fresh WITH (FORCE)")
+    conn.execute("DROP DATABASE fresh_db WITH (FORCE)")
     assert tables == 4
 ```
 ```python
@@ -1211,7 +1211,7 @@ async def record_llm_usage(
 +        with psycopg.connect(settings.database_url, autocommit=True) as conn:
              apply_schema(conn)
 ```
-③ 검증: `uv run pytest tests/test_api.py tests/test_db.py`, 이어서 `uv run pytest`(F2 단계 1에서 만든 `test_schema_upgrade_marks_rows_saved_before_f2_as_queued`가 체크포인트 `setup()` 재적용도 함께 확인)
+③ 검증: `uv run pytest tests/test_api.py tests/test_db.py`, 이어서 `uv run pytest`(F2 단계 1에서 만든 `test_schema_upgrade_marks_rows_saved_before_status_columns_as_queued`가 체크포인트 `setup()` 재적용도 함께 확인)
 
 ### 단계 6. 그래프 `graph` (실제 PostgreSQL, 가짜 클라이언트)
 ① 실패 테스트(순서: 유형별 경로 → 빈 본문(공백·줄바꿈 포함) → `node_done` 로그 → 출력 오류에도 토큰 기록 → 실패 뒤 재실행 시 분류 미호출)

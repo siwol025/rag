@@ -322,7 +322,7 @@ def test_new_job_is_queued_and_duplicate_reports_current_status(conn):
     assert create_job(conn, **JOB) == (job_id, False, "done")
 
 
-F1_JOBS_TABLE = """
+JOBS_TABLE_BEFORE_STATUS = """
 CREATE TABLE jobs (
     id           uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
     channel_id   text        NOT NULL,
@@ -335,12 +335,12 @@ CREATE TABLE jobs (
 """
 
 
-def test_schema_upgrade_marks_rows_saved_before_f2_as_queued(conn):
+def test_schema_upgrade_marks_rows_saved_before_status_columns_as_queued(conn):
     conn.execute("DROP TABLE jobs")
-    conn.execute(F1_JOBS_TABLE)  # F1 시절 테이블과 행
+    conn.execute(JOBS_TABLE_BEFORE_STATUS)  # F1 시절 테이블과 행
     conn.execute(
         "INSERT INTO jobs (channel_id, message_ts, user_id, message_text)"
-        " VALUES ('C0TARGET01', '1794381600.000100', 'U0HUMAN01', 'F1 행')"
+        " VALUES ('C0TARGET01', '1794381600.000100', 'U0HUMAN01', '예전 행')"
     )
     apply_schema(conn)
     row = conn.execute("SELECT status, attempts, started_at, finished_at, error FROM jobs").fetchone()

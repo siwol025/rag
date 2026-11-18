@@ -44,7 +44,7 @@ def database_url():
 @pytest.fixture
 def conn(database_url):
     with psycopg.connect(database_url, autocommit=True) as conn:
-        conn.execute("TRUNCATE jobs")
+        conn.execute("TRUNCATE jobs, llm_usage")
         yield conn
 
 

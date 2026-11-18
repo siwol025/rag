@@ -5,7 +5,17 @@ from uuid import UUID
 import psycopg
 import pytest
 
-from slack_rag.db import apply_schema, claim_job, complete_job, create_job, fail_job, queued_job_ids
+from fakes import CODE_FIX, QUESTION
+from slack_rag.db import (
+    apply_schema,
+    claim_job,
+    complete_job,
+    create_job,
+    fail_job,
+    load_job_text,
+    queued_job_ids,
+    record_llm_usage,
+)
 
 JOB = {
     "channel_id": "C0TARGET01",
@@ -53,7 +63,7 @@ def test_new_job_is_queued_and_duplicate_reports_current_status(conn):
     assert create_job(conn, **JOB) == (job_id, False, "done")
 
 
-F1_JOBS_TABLE = """
+JOBS_TABLE_BEFORE_STATUS = """
 CREATE TABLE jobs (
     id           uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
     channel_id   text        NOT NULL,
@@ -66,12 +76,12 @@ CREATE TABLE jobs (
 """
 
 
-def test_schema_upgrade_marks_rows_saved_before_f2_as_queued(conn):
+def test_schema_upgrade_marks_rows_saved_before_status_columns_as_queued(conn):
     conn.execute("DROP TABLE jobs")
-    conn.execute(F1_JOBS_TABLE)  # F1 시절 테이블과 행
+    conn.execute(JOBS_TABLE_BEFORE_STATUS)  # 상태 컬럼이 생기기 전 테이블과 행
     conn.execute(
         "INSERT INTO jobs (channel_id, message_ts, user_id, message_text)"
-        " VALUES ('C0TARGET01', '1794381600.000100', 'U0HUMAN01', 'F1 행')"
+        " VALUES ('C0TARGET01', '1794381600.000100', 'U0HUMAN01', '예전 행')"
     )
     apply_schema(conn)
     row = conn.execute("SELECT status, attempts, started_at, finished_at, error FROM jobs").fetchone()
@@ -94,10 +104,10 @@ async def test_claim_takes_queued_job_only_once_per_try(conn, aconn):
 @pytest.mark.anyio
 async def test_later_try_takes_over_running_job_and_earlier_try_cannot_complete(conn, aconn):
     job_id, _, _ = create_job(conn, **JOB)
-    await claim_job(aconn, job_id, 1)                      # 1번째 시도의 워커가 처리 중에 죽음
-    assert await claim_job(aconn, job_id, 2) is not None   # arq가 다시 실행한 2번째 시도
-    assert await complete_job(aconn, job_id, 1) is False   # 1번째가 늦게 끝나도 덮어쓰지 못함
-    assert await complete_job(aconn, job_id, 2) is True
+    await claim_job(aconn, job_id, 1)                                # 1번째 시도의 워커가 처리 중에 죽음
+    assert await claim_job(aconn, job_id, 2) is not None             # arq가 다시 실행한 2번째 시도
+    assert await complete_job(aconn, job_id, 1, QUESTION) is False   # 1번째가 늦게 끝나도 덮어쓰지 못함
+    assert await complete_job(aconn, job_id, 2, QUESTION) is True
     assert job_row(conn, job_id) == ("done", 2, None)
 
 
@@ -116,8 +126,8 @@ async def test_fail_job_isolates_only_unfinished_job(conn, aconn):
     await claim_job(aconn, running_id, 1)
     conn.execute("UPDATE jobs SET status = 'done' WHERE id = %s", (done_id,))
 
-    await fail_job(aconn, running_id, "max_tries_exceeded")
-    await fail_job(aconn, done_id, "max_tries_exceeded")
+    assert await fail_job(aconn, running_id, "max_tries_exceeded") is True  # 실제로 바꿈
+    assert await fail_job(aconn, done_id, "max_tries_exceeded") is False    # 이미 끝난 작업은 그대로
 
     assert job_row(conn, running_id) == ("failed", 1, "max_tries_exceeded")
     assert job_row(conn, done_id) == ("done", 0, None)
@@ -130,3 +140,36 @@ async def test_queued_job_ids_lists_waiting_jobs_oldest_first(conn, aconn):
     started, _, _ = create_job(conn, **JOB | {"message_ts": "1794381800.000300"})
     await claim_job(aconn, started, 1)
     assert await queued_job_ids(aconn) == [first, second]
+
+
+USAGE = {"input_tokens": 120, "output_tokens": 15, "thoughts_tokens": 4, "cached_tokens": 0}
+
+
+@pytest.mark.anyio
+async def test_record_llm_usage_appends_a_row_per_call(conn, aconn):
+    job_id, _, _ = create_job(conn, **JOB)
+    for job_try in (1, 2):  # 같은 노드를 다시 불렀으면(재시도) 실제 호출마다 한 줄
+        await record_llm_usage(aconn, job_id=job_id, job_try=job_try, node="classify", model="fake-light-model", **USAGE)
+    rows = conn.execute(
+        "SELECT job_try, node, model, input_tokens, output_tokens, thoughts_tokens, cached_tokens"
+        " FROM llm_usage WHERE job_id = %s ORDER BY id",
+        (job_id,),
+    ).fetchall()
+    assert rows == [(1, "classify", "fake-light-model", 120, 15, 4, 0), (2, "classify", "fake-light-model", 120, 15, 4, 0)]
+
+
+@pytest.mark.anyio
+async def test_load_job_text_reads_message_body(conn, aconn):
+    job_id, _, _ = create_job(conn, **JOB)
+    assert await load_job_text(aconn, job_id) == JOB["message_text"]
+
+
+@pytest.mark.anyio
+async def test_classification_is_saved_only_by_current_try(conn, aconn):
+    job_id, _, _ = create_job(conn, **JOB)
+    await claim_job(aconn, job_id, 1)
+    await claim_job(aconn, job_id, 2)
+    await complete_job(aconn, job_id, 2, QUESTION)
+    await complete_job(aconn, job_id, 1, CODE_FIX)  # 늦게 끝난 앞 시도의 결과
+    row = conn.execute("SELECT request_type, service, category FROM jobs WHERE id = %s", (job_id,)).fetchone()
+    assert row == tuple(QUESTION.values())
