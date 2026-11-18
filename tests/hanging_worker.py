@@ -8,7 +8,7 @@ from slack_rag import worker
 from slack_rag.config import Settings
 
 
-async def block_event_loop(job_id):
+async def block_event_loop(ctx, job_id, job_try):
     time.sleep(3600)  # await가 아닌 sleep: 타임아웃·취소가 끼어들 수 없음
 
 

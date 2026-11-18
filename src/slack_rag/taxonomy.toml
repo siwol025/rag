@@ -1,0 +1,17 @@
+# 분류 체계(TO-006). 키 = 꼬리표 ID(영문 소문자·숫자·하이픈), 값 = 표시 이름.
+# - ID는 한 번 정하면 바꾸거나 지우지 않고 추가만 한다(jobs와 검색 문서 꼬리표에 이미 저장됨).
+# - "unknown"은 코드가 항상 선택지에 덧붙이므로 여기에 쓰지 않는다.
+# - 아래는 샘플 목록이다. 대상 저장소를 정할 때(OQ-02) 실제 목록으로 바꾼다.
+
+[services]
+payment-api = "결제 API"
+order-api = "주문 API"
+auth-api = "인증·로그인"
+notification = "알림(푸시·메일)"
+
+[categories]
+server-error = "서버 오류(5xx, 예외)"
+latency = "응답 지연, 타임아웃"
+data-issue = "데이터 불일치·누락"
+deploy-config = "배포·설정 변경 문제"
+external-dependency = "외부 연동(PG사, 외부 API) 장애"

@@ -3,12 +3,18 @@ from pathlib import Path
 from uuid import UUID
 
 import psycopg
+from langgraph.checkpoint.postgres import PostgresSaver
 
 SCHEMA_SQL = Path(__file__).with_name("schema.sql").read_text(encoding="utf-8")
 
 
 def apply_schema(conn: psycopg.Connection) -> None:
+    """앱 테이블(schema.sql)과 LangGraph 체크포인트 테이블을 만든다.
+
+    conn은 autocommit이어야 한다: 체크포인트 인덱스가 CREATE INDEX CONCURRENTLY(트랜잭션 안 불가, 3.2).
+    """
     conn.execute(SCHEMA_SQL)
+    PostgresSaver(conn).setup()  # checkpoint_migrations를 보고 아직 안 한 마이그레이션만 실행
 
 
 def create_job(
@@ -57,30 +63,64 @@ async def claim_job(conn: psycopg.AsyncConnection, job_id: UUID, job_try: int) -
     return None if row is None else row[0]
 
 
-async def complete_job(conn: psycopg.AsyncConnection, job_id: UUID, job_try: int) -> bool:
-    """처리 중인 작업을 완료로 바꾼다. 그 사이 더 나중 시도가 가져갔으면 바꾸지 않고 False."""
+async def complete_job(
+    conn: psycopg.AsyncConnection, job_id: UUID, job_try: int, classification: dict[str, str]
+) -> bool:
+    """처리 중인 작업을 완료로 바꾸며 분류도 함께 쓴다. 그 사이 더 나중 시도가 가져갔으면 둘 다 쓰지 않고 False."""
     cur = await conn.execute(
         """
-        UPDATE jobs SET status = 'done', finished_at = now()
-        WHERE id = %s AND status = 'running' AND attempts = %s
+        UPDATE jobs
+        SET status = 'done', finished_at = now(),
+            request_type = %(request_type)s, service = %(service)s, category = %(category)s
+        WHERE id = %(job_id)s AND status = 'running' AND attempts = %(job_try)s
         """,
-        (job_id, job_try),
+        {"job_id": job_id, "job_try": job_try, **classification},
     )
     return cur.rowcount == 1
 
 
-async def fail_job(conn: psycopg.AsyncConnection, job_id: UUID, error: str) -> None:
-    """끝나지 않은 작업을 실패로 격리한다. 이미 끝난 작업은 그대로 둔다."""
-    await conn.execute(
+async def fail_job(conn: psycopg.AsyncConnection, job_id: UUID, error: str) -> bool:
+    """끝나지 않은 작업을 실패로 격리하고 True. 이미 끝난 작업은 그대로 두고 False."""
+    cur = await conn.execute(
         """
         UPDATE jobs SET status = 'failed', error = %s, finished_at = now()
         WHERE id = %s AND status IN ('queued', 'running')
         """,
         (error, job_id),
     )
+    return cur.rowcount == 1
 
 
 async def queued_job_ids(conn: psycopg.AsyncConnection) -> list[UUID]:
     """아직 어느 워커도 가져가지 않은 작업(오래된 순)."""
     cur = await conn.execute("SELECT id FROM jobs WHERE status = 'queued' ORDER BY created_at")
     return [row[0] for row in await cur.fetchall()]
+
+
+async def load_job_text(conn: psycopg.AsyncConnection, job_id: UUID) -> str:
+    """그래프의 첫 입력. 큐에는 job_id만 있으므로 본문은 DB에서 읽는다(TO-001)."""
+    cur = await conn.execute("SELECT message_text FROM jobs WHERE id = %s", (job_id,))
+    return (await cur.fetchone())[0]
+
+
+async def record_llm_usage(
+    conn: psycopg.AsyncConnection,
+    *,
+    job_id: UUID,
+    job_try: int,
+    node: str,
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    thoughts_tokens: int,
+    cached_tokens: int,
+) -> None:
+    """LLM 호출 1번을 기록한다. 비용은 저장하지 않고 조회 때 단가로 환산한다(3.8)."""
+    await conn.execute(
+        """
+        INSERT INTO llm_usage
+            (job_id, job_try, node, model, input_tokens, output_tokens, thoughts_tokens, cached_tokens)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        (job_id, job_try, node, model, input_tokens, output_tokens, thoughts_tokens, cached_tokens),
+    )

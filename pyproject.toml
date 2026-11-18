@@ -3,13 +3,17 @@ name = "slack-rag"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
-    "anyio>=4.16.0",                # main.py의 from_thread.run (fastapi 하위 의존을 직접 씀)
-    "arq>=0.28.0",                  # 큐(TO-004). redis[hiredis]>=4.2,<6 을 함께 설치
+    "anyio>=4.16.0",                          # main.py의 from_thread.run (fastapi 하위 의존을 직접 씀)
+    "arq>=0.28.0",                            # 큐(TO-004). redis[hiredis]>=4.2,<6 을 함께 설치
     "fastapi>=0.162.5",
+    "google-genai>=3.3.0",                    # Gemini API(TO-008). 직접 쓰는 곳은 llm.py뿐
+    "langgraph>=1.2.22",                      # 그래프(graph.py)
+    "langgraph-checkpoint>=4.3.2",            # graph.py가 serde(JsonPlusSerializer)를 직접 씀
+    "langgraph-checkpoint-postgres>=3.2.1",   # AsyncPostgresSaver(graph.py), PostgresSaver.setup(db.py)
     "pydantic>=2.14.3",
     "pydantic-settings>=2.16.2",
     "psycopg[binary,pool]>=3.3.8",
-    "redis>=5.3.1,<6",              # job_queue.py가 예외 클래스를 직접 씀. arq 0.28이 6 미만만 허용
+    "redis>=5.3.1,<6",                        # job_queue.py가 예외 클래스를 직접 씀. arq 0.28이 6 미만만 허용
     "uvicorn>=0.54.0",
 ]
 

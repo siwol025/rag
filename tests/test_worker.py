@@ -3,13 +3,18 @@ import logging
 import os
 import subprocess
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import anyio
 import pytest
+from arq import Retry
 from fastapi.testclient import TestClient
+from google.genai import errors
+from psycopg_pool import AsyncConnectionPool
 
-from slack_rag import job_queue, worker
+from fakes import CODE_FIX, DAILY_QUOTA, LLM_SETTINGS, MINUTE_QUOTA, OTHER, QUESTION, FakeGenai, quota_error
+from slack_rag import graph, job_queue, llm, worker
 from slack_rag.config import Settings
 from slack_rag.db import create_job
 from slack_rag.main import create_app
@@ -21,6 +26,14 @@ AUTH = {"X-API-Key": API_KEY}
 HANGING_WORKER = Path(__file__).with_name("hanging_worker.py")
 
 
+@pytest.fixture(autouse=True)
+def fake_llm(monkeypatch):
+    """워커가 만드는 Gemini 클라이언트를 가짜로 바꾼다. 자동 테스트는 실제 Gemini를 부르지 않는다(3.13)."""
+    fake = FakeGenai(QUESTION)
+    monkeypatch.setattr(llm, "make_client", lambda settings: fake)
+    return fake
+
+
 @pytest.fixture
 def settings(database_url, redis_url, conn):  # conn이 jobs를, redis_url이 Redis를 비움
     return Settings(
@@ -29,7 +42,20 @@ def settings(database_url, redis_url, conn):  # conn이 jobs를, redis_url이 Re
         redis_url=redis_url,
         jobs_api_key=API_KEY,
         slack_target_channel_ids={"C0TARGET01"},
+        **LLM_SETTINGS,
     )
+
+
+def worker_env(settings):
+    """띄울 워커 프로세스의 환경 변수(테스트 설정 그대로). cwd를 tmp_path로 두어 사용자의 .env를 읽지 않게 한다."""
+    return os.environ | {
+        "DATABASE_URL": settings.database_url,
+        "REDIS_URL": settings.redis_url,
+        "JOBS_API_KEY": settings.jobs_api_key,
+        "SLACK_TARGET_CHANNEL_IDS": json.dumps(sorted(settings.slack_target_channel_ids)),
+        "GEMINI_API_KEY": settings.gemini_api_key.get_secret_value(),
+        "LLM_LIGHT_MODEL": settings.llm_light_model,
+    }
 
 
 def make_job(conn, ts="1794381600.000100"):
@@ -48,6 +74,20 @@ async def enqueue(settings, job_id):
     try:
         await job_queue.enqueue(redis, job_id)
     finally:
+        await redis.aclose()
+
+
+@asynccontextmanager
+async def started_worker_ctx(settings, job_try):
+    """arq 없이 run_job을 직접 부를 ctx. 워커 시작 처리(풀·그래프·LLM 클라이언트)를 그대로 쓴다."""
+    w = worker.create_worker(settings, handle_signals=False)
+    redis = await job_queue.connect(settings.redis_url)
+    ctx = {"redis": redis, "job_try": job_try}
+    try:
+        await w.on_startup(ctx)
+        yield ctx
+    finally:
+        await w.on_shutdown(ctx)
         await redis.aclose()
 
 
@@ -80,8 +120,9 @@ async def test_worker_start_enqueues_jobs_left_only_in_db(settings, conn):
 async def test_worker_does_not_process_finished_job_again(settings, conn, monkeypatch):
     handled = []
 
-    async def record(job_id):
+    async def record(ctx, job_id, job_try):
         handled.append(job_id)
+        return OTHER
 
     monkeypatch.setattr(worker, "handle_job", record)
     job_id = make_job(conn)
@@ -103,11 +144,11 @@ async def test_worker_logs_queue_wait_and_processing_time_with_job_id(settings, 
     assert logged["job_done"]["duration_ms"] >= 0
 
 
-async def raise_error(job_id):
+async def raise_error(ctx, job_id, job_try):
     raise RuntimeError("처리 실패")
 
 
-async def hang(job_id):
+async def hang(ctx, job_id, job_try):
     await anyio.sleep(3600)
 
 
@@ -122,12 +163,29 @@ async def test_job_failing_every_try_is_isolated_as_failed(settings, conn, monke
     assert row == ("failed", worker.MAX_TRIES, "max_tries_exceeded")
 
 
+async def test_record_run_logs_job_failed_only_when_it_isolates(settings, conn, caplog):
+    caplog.set_level(logging.INFO, logger="slack_rag")
+    done_id = make_job(conn)  # 3번째 시도가 done을 커밋한 직후 종료된 작업
+    running_id = make_job(conn, ts="1794381700.000200")
+    conn.execute("UPDATE jobs SET status = 'done' WHERE id = %s", (done_id,))
+    conn.execute("UPDATE jobs SET status = 'running', attempts = 3 WHERE id = %s", (running_id,))
+
+    async with AsyncConnectionPool(settings.database_url, open=False) as db:
+        for job_id in (done_id, running_id):  # arq의 4번째(기록용) 실행
+            await worker.run_job({"job_try": worker.MAX_TRIES + 1, "db": db}, str(job_id))
+
+    events = [(r.getMessage(), r.fields["job_id"]) for r in caplog.records if r.name == "slack_rag.worker"]
+    assert events == [("job_skipped", str(done_id)), ("job_failed", str(running_id))]
+    assert job_row(conn, done_id) == ("done", 0)
+
+
 async def test_two_workers_process_each_job_exactly_once(settings, conn, monkeypatch):
     handled = []
 
-    async def record(job_id):
+    async def record(ctx, job_id, job_try):
         handled.append(job_id)
         await anyio.sleep(0.05)  # 두 워커가 겹쳐 돌게 함
+        return OTHER
 
     monkeypatch.setattr(worker, "handle_job", record)
     job_ids = [make_job(conn, ts=f"1794381600.{i:06d}") for i in range(10)]
@@ -146,14 +204,7 @@ async def wait_for_status(conn, job_id, expected, timeout=30):
 
 async def test_job_of_killed_worker_is_processed_again(settings, conn, tmp_path):
     job_id = make_job(conn)  # 큐 적재는 띄운 워커의 시작 보정이 함
-    env = os.environ | {
-        "DATABASE_URL": settings.database_url,
-        "REDIS_URL": settings.redis_url,
-        "JOBS_API_KEY": settings.jobs_api_key,
-        "SLACK_TARGET_CHANNEL_IDS": json.dumps(sorted(settings.slack_target_channel_ids)),
-    }
-    # cwd=tmp_path: 사용자의 .env를 읽지 않게
-    proc = subprocess.Popen([sys.executable, str(HANGING_WORKER)], env=env, cwd=tmp_path)
+    proc = subprocess.Popen([sys.executable, str(HANGING_WORKER)], env=worker_env(settings), cwd=tmp_path)
     try:
         await wait_for_status(conn, job_id, "running")
     finally:
@@ -180,7 +231,7 @@ async def test_hundred_requests_get_202_at_once_and_all_become_done(settings, co
 
 async def test_db_failure_at_startup_reports_real_cause_not_keyerror(settings, monkeypatch):
     # 워커가 시작할 때 DB에 붙지 못하면 arq는 shutdown도 부른다. 그때 원인(PoolTimeout) 대신
-    # ctx["db"]가 없어 KeyError가 나면 안 된다(F2 리뷰 지적 #1).
+    # ctx["db"]가 없어 KeyError가 나면 안 된다(큐 적재·워커 구현 리뷰 지적 #1).
     from psycopg_pool import PoolTimeout
 
     closed = []
@@ -204,3 +255,137 @@ async def test_db_failure_at_startup_reports_real_cause_not_keyerror(settings, m
     await w.on_shutdown(ctx)  # KeyError 없이 풀을 닫아야 한다
 
     assert closed == [True]
+
+
+async def test_processed_job_records_classification_and_model_usage(settings, conn):
+    job_id = make_job(conn)
+    await run_burst(settings)
+    row = conn.execute("SELECT status, request_type, service, category FROM jobs WHERE id = %s", (job_id,)).fetchone()
+    assert row == ("done", *QUESTION.values())
+    usage = conn.execute("SELECT job_try, node, model FROM llm_usage WHERE job_id = %s", (job_id,)).fetchall()
+    assert usage == [(1, "classify", "fake-light-model")]
+
+
+async def test_rate_limited_job_waits_in_place_and_finishes_in_the_same_try(settings, conn, fake_llm, monkeypatch):
+    monkeypatch.setattr(llm, "RATE_LIMIT_WAIT_S", 0)  # 실제로 60초씩 기다리지 않게
+    answers = iter([quota_error(MINUTE_QUOTA)] * 2 + [QUESTION])  # 분당 429 두 번 뒤 성공
+    fake_llm.answer = lambda contents: next(answers)
+    job_id = make_job(conn)
+    await run_burst(settings)
+    row = conn.execute("SELECT status, attempts, request_type FROM jobs WHERE id = %s", (job_id,)).fetchone()
+    assert row == ("done", 1, "question")  # 시도 번호를 쓰지 않고 같은 시도로 완료
+    assert len(fake_llm.calls) == 3
+
+
+async def test_rate_limit_beyond_max_waits_retries_the_job_using_a_try(settings, conn, fake_llm, monkeypatch):
+    monkeypatch.setattr(llm, "RATE_LIMIT_WAIT_S", 0)
+    fake_llm.answer = quota_error(MINUTE_QUOTA)  # 계속 분당 429
+    job_id = make_job(conn)
+    async with started_worker_ctx(settings, job_try=1) as ctx:
+        with pytest.raises(Retry) as retry:
+            await worker.run_job(ctx, str(job_id))
+    assert retry.value.defer_score == worker.RETRY_DELAY_S * 1000  # 일반 일시 오류와 같이 10초 뒤
+    assert len(fake_llm.calls) == llm.RATE_LIMIT_MAX_WAITS + 1     # 처음 1번 + 대기 뒤 5번
+    assert job_row(conn, job_id) == ("running", 1)
+
+
+async def test_daily_quota_exhausted_job_is_isolated_without_more_calls(settings, conn, fake_llm):
+    fake_llm.answer = quota_error(DAILY_QUOTA)
+    job_id = make_job(conn)
+    await run_burst(settings)
+    row = conn.execute("SELECT status, attempts, error FROM jobs WHERE id = %s", (job_id,)).fetchone()
+    assert row == ("failed", 1, "llm_quota_exhausted")
+    assert len(fake_llm.calls) == 1  # 오늘은 풀리지 않으므로 다시 부르지 않음
+
+
+@pytest.mark.parametrize("code", [400, 401, 403, 404])
+async def test_rejected_request_is_isolated_without_retry(settings, conn, fake_llm, caplog, code):
+    caplog.set_level(logging.INFO, logger="slack_rag")
+    fake_llm.answer = errors.ClientError(code, {"error": {"code": code, "status": "REJECTED", "message": "bad request"}})
+    job_id = make_job(conn)
+    await run_burst(settings)
+    row = conn.execute("SELECT status, attempts, error FROM jobs WHERE id = %s", (job_id,)).fetchone()
+    assert row == ("failed", 1, "llm_request_rejected")
+    assert len(fake_llm.calls) == 1  # 다시 보내도 같은 답이므로 시도 3번을 쓰지 않음
+    [failed] = [r.fields for r in caplog.records if r.getMessage() == "job_failed"]
+    assert str(code) in failed["detail"]  # 원인(응답 상태)이 로그에 남음
+
+
+async def test_sample_messages_get_classification_saved_and_route_chosen(settings, conn, caplog, fake_llm, make_event):
+    samples = {  # 본문 → (가짜 모델 응답, 기대 경로 노드)
+        "예전에 결제 5xx 장애 있었나요?": (QUESTION, "answer_question"),
+        "주문 API 타임아웃 급증, 원인 찾아 고쳐 주세요": (CODE_FIX, "propose_fix"),
+        "오늘 점심 같이 드실 분?": (OTHER, None),
+        "": (OTHER, None),       # 파일만 올린 메시지: 모델을 부르지 않음
+        " \n\t": (OTHER, None),  # 공백·줄바꿈만: 모델을 부르지 않음(가정 C5)
+    }
+    fake_llm.answer = lambda contents: next(
+        answer for text, (answer, _) in samples.items() if text.strip() and text in contents
+    )
+    with TestClient(create_app(settings)) as client:
+        job_ids = {
+            text: client.post("/jobs", json=make_event(ts=f"1794381600.{i:06d}", text=text), headers=AUTH).json()["job_id"]
+            for i, text in enumerate(samples)
+        }
+    caplog.set_level(logging.INFO, logger="slack_rag")
+
+    await run_burst(settings)
+
+    for text, (answer, _) in samples.items():
+        row = conn.execute(
+            "SELECT status, request_type, service, category FROM jobs WHERE id = %s", (job_ids[text],)
+        ).fetchone()
+        assert row == ("done", *answer.values())
+    reached = {r.fields["job_id"]: r.fields["node"] for r in caplog.records if r.getMessage() == "node_reached"}
+    assert reached == {job_ids[text]: node for text, (_, node) in samples.items() if node}
+    assert len(fake_llm.calls) == 3
+
+
+KILLED_AFTER_CLASSIFY_WORKER = Path(__file__).with_name("killed_after_classify_worker.py")
+
+
+async def wait_until_classified(settings, job_id, timeout=30):
+    """체크포인트에 분류가 저장될 때까지 기다린다(그 뒤에 죽여야 '분류 뒤 종료'가 된다)."""
+    async with graph.checkpoint_pool(settings.database_url) as checkpoints:
+        compiled = graph.build(checkpoints)
+        with anyio.fail_after(timeout):
+            while "classification" not in (await compiled.aget_state(graph.thread_config(job_id))).values:
+                await anyio.sleep(0.1)
+
+
+async def test_reprocessing_after_kill_does_not_call_classifier_again(settings, conn, tmp_path, fake_llm):
+    job_id = make_job(conn)  # 큐 적재는 띄운 워커의 시작 보정이 함
+    proc = subprocess.Popen(
+        [sys.executable, str(KILLED_AFTER_CLASSIFY_WORKER)], env=worker_env(settings), cwd=tmp_path
+    )
+    try:
+        await wait_until_classified(settings, job_id)
+    finally:
+        proc.kill()  # SIGKILL: 분류는 끝났고 다음 노드를 처리하던 중
+        proc.wait()
+
+    fake_llm.answer = CODE_FIX  # 다시 불리면 다른 라벨이 저장되어 드러난다
+    await run_burst(settings)   # 실행 중 표시가 만료(약 15초)되면 2번째 시도가 체크포인트에서 이어 감
+
+    row = conn.execute(
+        "SELECT status, attempts, request_type, service, category FROM jobs WHERE id = %s", (job_id,)
+    ).fetchone()
+    assert row == ("done", 2, *QUESTION.values())
+    assert fake_llm.calls == []  # 분류를 다시 부르지 않음
+    assert conn.execute("SELECT job_try FROM llm_usage WHERE job_id = %s", (job_id,)).fetchall() == [(1,)]
+
+
+SLOW_WORKER = Path(__file__).with_name("slow_worker.py")
+
+
+async def test_sigterm_lets_running_job_finish_without_using_a_try(settings, conn, tmp_path):
+    job_id = make_job(conn)
+    proc = subprocess.Popen([sys.executable, str(SLOW_WORKER)], env=worker_env(settings), cwd=tmp_path)
+    try:
+        await wait_for_status(conn, job_id, "running")
+        proc.terminate()       # SIGTERM = docker compose stop
+        proc.wait(timeout=30)  # 작업을 끝낸 뒤 스스로 종료
+    finally:
+        proc.kill()
+        proc.wait()
+    assert job_row(conn, job_id) == ("done", 1)  # 취소·재실행 없이 첫 시도로 완료

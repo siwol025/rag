@@ -3,6 +3,7 @@ import secrets
 from contextlib import asynccontextmanager
 from typing import Annotated
 
+import psycopg
 from anyio import from_thread
 from fastapi import Depends, FastAPI, Header, HTTPException, Response, status
 from psycopg_pool import ConnectionPool
@@ -25,7 +26,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         pool.open(wait=True)  # DB에 못 붙으면 기본 30초 뒤 시작 실패
-        with pool.connection() as conn:
+        # 체크포인트 테이블의 CREATE INDEX CONCURRENTLY는 트랜잭션 밖에서만 돈다 → autocommit 연결로 적용(3.2)
+        with psycopg.connect(settings.database_url, autocommit=True) as conn:
             apply_schema(conn)
         app.state.queue = await job_queue.connect(settings.redis_url)  # 못 붙으면 약 5초 재시도 뒤 시작 실패
         yield

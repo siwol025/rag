@@ -1,9 +1,11 @@
 import logging
 
+import psycopg
 import pytest
 from arq.constants import default_queue_name
 from fastapi.testclient import TestClient
 
+from fakes import LLM_SETTINGS
 from slack_rag.config import Settings
 from slack_rag.db import create_job
 from slack_rag.main import create_app
@@ -20,6 +22,7 @@ def client(database_url, redis_url, conn):  # conn이 jobs를, redis_url이 Redi
         redis_url=redis_url,
         jobs_api_key=API_KEY,
         slack_target_channel_ids={"C0TARGET01"},
+        **LLM_SETTINGS,
     )
     with TestClient(create_app(settings)) as client:  # with로 lifespan(풀, 스키마) 실행
         yield client
@@ -136,6 +139,7 @@ def test_returns_503_and_keeps_job_queued_when_queue_is_down(database_url, conn,
         redis_url=redis_url,
         jobs_api_key=API_KEY,
         slack_target_channel_ids={"C0TARGET01"},
+        **LLM_SETTINGS,  # 필수 키
     )
     with TestClient(create_app(settings)) as client:
         container.get_wrapped_container().stop()  # 앱이 뜬 뒤 Redis 중단
@@ -143,3 +147,27 @@ def test_returns_503_and_keeps_job_queued_when_queue_is_down(database_url, conn,
     assert res.status_code == 503
     assert res.json() == {"detail": "queue unavailable"}
     assert conn.execute("SELECT status FROM jobs").fetchall() == [("queued",)]
+
+
+def test_app_start_creates_checkpoint_and_usage_tables_in_fresh_database(database_url, redis_url, conn):
+    conn.execute("DROP DATABASE IF EXISTS fresh_db WITH (FORCE)")
+    conn.execute("CREATE DATABASE fresh_db")
+    fresh_url = database_url.rsplit("/", 1)[0] + "/fresh_db"
+    settings = Settings(
+        _env_file=None,
+        database_url=fresh_url,
+        redis_url=redis_url,
+        jobs_api_key=API_KEY,
+        slack_target_channel_ids={"C0TARGET01"},
+        **LLM_SETTINGS,
+    )
+    with TestClient(create_app(settings)):  # lifespan이 스키마를 처음 적용(CREATE INDEX CONCURRENTLY 포함)
+        pass
+    with psycopg.connect(fresh_url) as fresh:
+        tables = fresh.execute(
+            "SELECT count(*) FROM pg_tables"
+            " WHERE tablename IN ('checkpoints', 'checkpoint_blobs', 'checkpoint_writes', 'llm_usage')"
+        ).fetchone()[0]
+        fresh.execute("SELECT request_type, service, category FROM jobs LIMIT 0")  # 분류 컬럼이 있어야 함
+    conn.execute("DROP DATABASE fresh_db WITH (FORCE)")
+    assert tables == 4
