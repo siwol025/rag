@@ -3,6 +3,7 @@ import logging
 import os
 import subprocess
 import sys
+import tomllib
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -13,7 +14,19 @@ from fastapi.testclient import TestClient
 from google.genai import errors
 from psycopg_pool import AsyncConnectionPool
 
-from fakes import CODE_FIX, DAILY_QUOTA, LLM_SETTINGS, MINUTE_QUOTA, OTHER, QUESTION, FakeGenai, quota_error
+from fakes import (
+    CODE_FIX,
+    DAILY_QUOTA,
+    FAKE_MIN_SIMILARITY,
+    LLM_SETTINGS,
+    MINUTE_QUOTA,
+    OTHER,
+    QUESTION,
+    FakeGenai,
+    cite_first,
+    classify_then_cite,
+    quota_error,
+)
 from slack_rag import graph, job_queue, llm, worker
 from slack_rag.config import Settings
 from slack_rag.db import create_job
@@ -24,6 +37,9 @@ pytestmark = pytest.mark.anyio
 API_KEY = "test-api-key"
 AUTH = {"X-API-Key": API_KEY}
 HANGING_WORKER = Path(__file__).with_name("hanging_worker.py")
+DECOY_QUESTION = "결제 API에서 5xx 응답이 급증하고 커넥션 풀이 고갈됐던 장애가 있었나요?"
+PAYMENT_5XX = {"request_type": "question", "service": "payment-api", "category": "server-error"}
+RAG_QUERIES = tomllib.loads(Path(__file__).with_name("rag_queries.toml").read_text(encoding="utf-8"))
 
 
 @pytest.fixture(autouse=True)
@@ -55,13 +71,12 @@ def worker_env(settings):
         "SLACK_TARGET_CHANNEL_IDS": json.dumps(sorted(settings.slack_target_channel_ids)),
         "GEMINI_API_KEY": settings.gemini_api_key.get_secret_value(),
         "LLM_LIGHT_MODEL": settings.llm_light_model,
+        "EMBEDDING_MODEL": settings.embedding_model,
     }
 
 
-def make_job(conn, ts="1794381600.000100"):
-    job_id, _, _ = create_job(
-        conn, channel_id="C0TARGET01", message_ts=ts, user_id="U0HUMAN01", message_text="결제 API 5xx 급증"
-    )
+def make_job(conn, ts="1794381600.000100", text="결제 API 5xx 급증"):
+    job_id, _, _ = create_job(conn, channel_id="C0TARGET01", message_ts=ts, user_id="U0HUMAN01", message_text=text)
     return job_id
 
 
@@ -122,7 +137,7 @@ async def test_worker_does_not_process_finished_job_again(settings, conn, monkey
 
     async def record(ctx, job_id, job_try):
         handled.append(job_id)
-        return OTHER
+        return {"classification": OTHER}  # handle_job은 최종 State를 돌려준다
 
     monkeypatch.setattr(worker, "handle_job", record)
     job_id = make_job(conn)
@@ -185,7 +200,7 @@ async def test_two_workers_process_each_job_exactly_once(settings, conn, monkeyp
     async def record(ctx, job_id, job_try):
         handled.append(job_id)
         await anyio.sleep(0.05)  # 두 워커가 겹쳐 돌게 함
-        return OTHER
+        return {"classification": OTHER}  # handle_job은 최종 State를 돌려준다
 
     monkeypatch.setattr(worker, "handle_job", record)
     job_ids = [make_job(conn, ts=f"1794381600.{i:06d}") for i in range(10)]
@@ -262,8 +277,10 @@ async def test_processed_job_records_classification_and_model_usage(settings, co
     await run_burst(settings)
     row = conn.execute("SELECT status, request_type, service, category FROM jobs WHERE id = %s", (job_id,)).fetchone()
     assert row == ("done", *QUESTION.values())
-    usage = conn.execute("SELECT job_try, node, model FROM llm_usage WHERE job_id = %s", (job_id,)).fetchall()
-    assert usage == [(1, "classify", "fake-light-model")]
+    usage = conn.execute(
+        "SELECT job_try, node, model FROM llm_usage WHERE job_id = %s ORDER BY id", (job_id,)
+    ).fetchall()
+    assert usage == [(1, "classify", "fake-light-model"), (1, "retrieve", "fake-embedding-model")]
 
 
 async def test_rate_limited_job_waits_in_place_and_finishes_in_the_same_try(settings, conn, fake_llm, monkeypatch):
@@ -312,8 +329,8 @@ async def test_rejected_request_is_isolated_without_retry(settings, conn, fake_l
 
 
 async def test_sample_messages_get_classification_saved_and_route_chosen(settings, conn, caplog, fake_llm, make_event):
-    samples = {  # 본문 → (가짜 모델 응답, 기대 경로 노드)
-        "예전에 결제 5xx 장애 있었나요?": (QUESTION, "answer_question"),
+    samples = {  # 본문 → (가짜 모델 응답, node_reached를 남기는 노드)
+        "예전에 결제 5xx 장애 있었나요?": (QUESTION, None),  # 검색·답변 노드는 node_done을 남김(node_reached 없음)
         "주문 API 타임아웃 급증, 원인 찾아 고쳐 주세요": (CODE_FIX, "propose_fix"),
         "오늘 점심 같이 드실 분?": (OTHER, None),
         "": (OTHER, None),       # 파일만 올린 메시지: 모델을 부르지 않음
@@ -338,18 +355,21 @@ async def test_sample_messages_get_classification_saved_and_route_chosen(setting
         assert row == ("done", *answer.values())
     reached = {r.fields["job_id"]: r.fields["node"] for r in caplog.records if r.getMessage() == "node_reached"}
     assert reached == {job_ids[text]: node for text, (_, node) in samples.items() if node}
-    assert len(fake_llm.calls) == 3
+    question_id = job_ids["예전에 결제 5xx 장애 있었나요?"]
+    done = [r.fields["node"] for r in caplog.records if r.getMessage() == "node_done" and r.fields["job_id"] == question_id]
+    assert done == ["classify", "retrieve", "answer_question"]  # question 경로: 분류 → 검색 → 답변
+    assert len(fake_llm.calls) == 3  # 분류 3번. 색인된 문서가 없어 답변 모델은 부르지 않음
 
 
 KILLED_AFTER_CLASSIFY_WORKER = Path(__file__).with_name("killed_after_classify_worker.py")
 
 
-async def wait_until_classified(settings, job_id, timeout=30):
-    """체크포인트에 분류가 저장될 때까지 기다린다(그 뒤에 죽여야 '분류 뒤 종료'가 된다)."""
+async def wait_until_retrieved(settings, job_id, timeout=30):
+    """체크포인트에 검색 결과가 저장될 때까지 기다린다(그 뒤에 죽여야 '분류·검색 뒤 종료'가 된다)."""
     async with graph.checkpoint_pool(settings.database_url) as checkpoints:
         compiled = graph.build(checkpoints)
         with anyio.fail_after(timeout):
-            while "classification" not in (await compiled.aget_state(graph.thread_config(job_id))).values:
+            while "retrieval" not in (await compiled.aget_state(graph.thread_config(job_id))).values:
                 await anyio.sleep(0.1)
 
 
@@ -359,9 +379,9 @@ async def test_reprocessing_after_kill_does_not_call_classifier_again(settings, 
         [sys.executable, str(KILLED_AFTER_CLASSIFY_WORKER)], env=worker_env(settings), cwd=tmp_path
     )
     try:
-        await wait_until_classified(settings, job_id)
+        await wait_until_retrieved(settings, job_id)  # 분류만 기다리면 검색 중에 죽여 결과가 흔들림
     finally:
-        proc.kill()  # SIGKILL: 분류는 끝났고 다음 노드를 처리하던 중
+        proc.kill()  # SIGKILL: 분류·검색은 끝났고 답변 노드에서 멈춘 중
         proc.wait()
 
     fake_llm.answer = CODE_FIX  # 다시 불리면 다른 라벨이 저장되어 드러난다
@@ -371,8 +391,9 @@ async def test_reprocessing_after_kill_does_not_call_classifier_again(settings, 
         "SELECT status, attempts, request_type, service, category FROM jobs WHERE id = %s", (job_id,)
     ).fetchone()
     assert row == ("done", 2, *QUESTION.values())
-    assert fake_llm.calls == []  # 분류를 다시 부르지 않음
-    assert conn.execute("SELECT job_try FROM llm_usage WHERE job_id = %s", (job_id,)).fetchall() == [(1,)]
+    assert fake_llm.calls == [] and fake_llm.embed_calls == []  # 분류도 질문 임베딩도 다시 부르지 않음
+    usage = conn.execute("SELECT job_try, node FROM llm_usage WHERE job_id = %s ORDER BY id", (job_id,)).fetchall()
+    assert usage == [(1, "classify"), (1, "retrieve")]
 
 
 SLOW_WORKER = Path(__file__).with_name("slow_worker.py")
@@ -389,3 +410,59 @@ async def test_sigterm_lets_running_job_finish_without_using_a_try(settings, con
         proc.kill()
         proc.wait()
     assert job_row(conn, job_id) == ("done", 1)  # 취소·재실행 없이 첫 시도로 완료
+
+
+async def test_question_job_saves_answer_with_completion(settings, conn, fake_llm, indexed_samples, monkeypatch):
+    monkeypatch.setattr(graph, "MIN_SIMILARITY", FAKE_MIN_SIMILARITY)
+    fake_llm.answer = classify_then_cite(PAYMENT_5XX)
+    job_id = make_job(conn, text=DECOY_QUESTION)
+    await run_burst(settings)
+    row = conn.execute("SELECT status, request_type, answer FROM jobs WHERE id = %s", (job_id,)).fetchone()
+    assert row == ("done", "question", {"found": True, "answer": "가짜 답변입니다.", "citations": ["pm-2026-001#2"]})
+
+
+async def test_job_that_is_not_a_question_has_no_answer(settings, conn, fake_llm):
+    fake_llm.answer = CODE_FIX
+    job_id = make_job(conn)
+    await run_burst(settings)
+    assert conn.execute("SELECT status, answer IS NULL FROM jobs WHERE id = %s", (job_id,)).fetchone() == ("done", True)
+
+
+async def test_daily_quota_on_question_embedding_isolates_job_without_more_calls(settings, conn, fake_llm):
+    fake_llm.embed = quota_error(DAILY_QUOTA)  # 분류는 성공, 질문 임베딩에서 일일 한도
+    job_id = make_job(conn)
+    await run_burst(settings)
+    row = conn.execute("SELECT status, attempts, error FROM jobs WHERE id = %s", (job_id,)).fetchone()
+    assert row == ("failed", 1, "llm_quota_exhausted")
+    assert len(fake_llm.embed_calls) == 1
+
+
+async def test_known_incident_questions_find_their_documents_in_top_results(
+    settings, conn, fake_llm, indexed_samples, make_event, monkeypatch
+):
+    # 가짜 임베딩이라 "배관"(입력 형식·꼬리표 선필터·단계 넓히기·정렬·저장)을 본다. 의미 품질은 test_live_rag.py
+    monkeypatch.setattr(graph, "MIN_SIMILARITY", FAKE_MIN_SIMILARITY)
+    queries = RAG_QUERIES["queries"]
+    labels = {q["text"]: {"request_type": "question", "service": q["service"], "category": q["category"]} for q in queries}
+    fake_llm.answer = lambda contents: cite_first(contents) if contents.startswith("<question>") else next(
+        label for text, label in labels.items() if text in contents
+    )
+    with TestClient(create_app(settings)) as client:
+        job_ids = {
+            q["text"]: client.post(
+                "/jobs", json=make_event(ts=f"1794381600.{i:06d}", text=q["text"]), headers=AUTH
+            ).json()["job_id"]
+            for i, q in enumerate(queries)
+        }
+
+    await run_burst(settings)
+
+    assert conn.execute("SELECT status, count(*) FROM jobs GROUP BY status").fetchall() == [("done", len(queries))]
+    async with graph.checkpoint_pool(settings.database_url) as checkpoints:
+        compiled = graph.build(checkpoints)
+        for q in queries:
+            values = (await compiled.aget_state(graph.thread_config(job_ids[q["text"]]))).values
+            top = [chunk["doc_id"] for chunk in values["retrieval"]["chunks"]]  # 기준 이상, 최대 SEARCH_K개
+            assert q["expected"] in top, (q["text"], top)
+            answer = conn.execute("SELECT answer FROM jobs WHERE id = %s", (job_ids[q["text"]],)).fetchone()[0]
+            assert answer["found"] is True and answer["citations"][0].startswith(q["expected"] + "#")

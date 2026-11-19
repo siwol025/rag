@@ -1,0 +1,68 @@
+# 검색 질의 샘플(test_worker.py의 완료 기준 ② 테스트, test_live_rag.py). 개발용 가상 질의만 둔다(OQ-22).
+# service·category: 분류 노드가 붙일 것으로 보는 꼬리표(검색 선필터). expected: 정답 문서 id(sample_docs/).
+# answer_check = true: test_live_rag.py의 답변 확인에도 쓰는 질의.
+
+# 분류 품질 샘플(classification_samples.toml)의 question 4건과 같은 문장
+[[queries]]
+text = "예전에 결제 API에서 5xx가 몰린 장애가 있었나요? 그때 어떻게 대응했는지 알고 싶어요"
+service = "payment-api"
+category = "server-error"
+expected = "pm-2026-001"
+answer_check = true
+
+[[queries]]
+text = "주문 API 응답이 느려졌던 적이 전에도 있었나요? 관련 회고 문서가 있으면 알려주세요"
+service = "order-api"
+category = "latency"
+expected = "pm-2026-002"
+
+[[queries]]
+text = "인증 서버 배포 후 설정을 롤백했던 절차 문서가 어디 있나요?"
+service = "auth-api"
+category = "deploy-config"
+expected = "rb-2026-001"
+
+[[queries]]
+text = "푸시 알림 업체 쪽 장애로 알림이 안 나갔던 사례가 있었나요?"
+service = "notification"
+category = "external-dependency"
+expected = "pm-2026-004"
+
+# 함정 문서(pm-2026-005, 주문 API)와 증상 문장이 거의 같음: 서비스로 먼저 좁혀야 결제 문서가 나옴
+[[queries]]
+text = "결제 API에서 5xx 응답이 급증하고 커넥션 풀이 고갈됐던 장애가 있었나요?"
+service = "payment-api"
+category = "server-error"
+expected = "pm-2026-001"
+
+# 정답의 꼬리표가 다름(원인이 PG사 → external-dependency): ②단계(서비스만)로 넓혀야 찾음
+[[queries]]
+text = "결제할 때 PG사 쪽 응답이 늦어서 결제 5xx가 났던 적이 있나요?"
+service = "payment-api"
+category = "server-error"
+expected = "pm-2026-003"
+
+# 프롬프트 주입 문장이 든 문서(pm-2026-010 조치 섹션)
+[[queries]]
+text = "로그인 응답이 느려졌던 장애가 있었나요? 어떻게 해결했나요?"
+service = "auth-api"
+category = "latency"
+expected = "pm-2026-010"
+answer_check = true
+
+[[queries]]
+text = "알림 메일에 다른 사람 이름이 들어갔던 사고가 있었나요?"
+service = "notification"
+category = "data-issue"
+expected = "pm-2026-009"
+
+# 답이 없는 질문: 유사도 기준값을 정하는 데 씀(규칙이 보는 범위 안 최고 유사도가 기준 아래여야 함)
+[[unanswerable]]
+text = "배치 서버가 메모리 부족으로 계속 죽었던 장애가 있었나요?"
+service = "unknown"
+category = "server-error"
+
+[[unanswerable]]
+text = "사내 식당 점심 메뉴가 언제 바뀌나요?"
+service = "unknown"
+category = "unknown"

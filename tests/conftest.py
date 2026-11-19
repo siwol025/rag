@@ -10,9 +10,11 @@ import pytest  # noqa: E402
 from testcontainers.community.postgres import PostgresContainer  # noqa: E402
 from testcontainers.community.redis import RedisContainer  # noqa: E402
 
+from fakes import LLM_SETTINGS, QUESTION, SAMPLE_DOCS, FakeGenai  # noqa: E402
+from slack_rag import indexer  # noqa: E402
 from slack_rag.db import apply_schema  # noqa: E402
 
-POSTGRES_IMAGE = "postgres:18.6-alpine"  # docker-compose.yml과 같은 이미지
+POSTGRES_IMAGE = "pgvector/pgvector:0.8.7-pg18-trixie"  # pgvector 포함(TO-012). docker-compose.yml과 같은 이미지
 REDIS_IMAGE = "redis:8.10.3-alpine"  # docker-compose.yml과 같은 이미지
 
 
@@ -44,7 +46,7 @@ def database_url():
 @pytest.fixture
 def conn(database_url):
     with psycopg.connect(database_url, autocommit=True) as conn:
-        conn.execute("TRUNCATE jobs, llm_usage")
+        conn.execute("TRUNCATE jobs, llm_usage, documents, chunks, index_usage")  # chunks는 documents를 참조
         yield conn
 
 
@@ -57,6 +59,14 @@ def anyio_backend():
 async def aconn(database_url, conn):  # conn이 jobs를 비움
     async with await psycopg.AsyncConnection.connect(database_url, autocommit=True) as aconn:
         yield aconn
+
+
+@pytest.fixture
+async def indexed_samples(database_url, conn):  # conn이 표를 먼저 비움
+    """sample_docs/ 12개를 가짜 임베딩으로 색인한다(48조각, 네트워크 없음, 수십 ms)."""
+    async with await psycopg.AsyncConnection.connect(database_url, autocommit=True) as aconn:
+        result = await indexer.index_once(aconn, FakeGenai(QUESTION), LLM_SETTINGS["embedding_model"], SAMPLE_DOCS)
+    assert (result.saved, result.rejected) == (12, {})
 
 
 def redis_url_of(container: RedisContainer) -> str:

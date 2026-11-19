@@ -173,3 +173,18 @@ async def test_classification_is_saved_only_by_current_try(conn, aconn):
     await complete_job(aconn, job_id, 1, CODE_FIX)  # 늦게 끝난 앞 시도의 결과
     row = conn.execute("SELECT request_type, service, category FROM jobs WHERE id = %s", (job_id,)).fetchone()
     assert row == tuple(QUESTION.values())
+
+
+@pytest.mark.anyio
+async def test_answer_is_saved_with_completion_only_by_current_try(conn, aconn):
+    answer = {"found": True, "answer": "있었습니다.", "citations": ["pm-2026-001#1"]}
+    job_id, _, _ = create_job(conn, **JOB)
+    other_id, _, _ = create_job(conn, **JOB | {"message_ts": "1794381700.000200"})
+    await claim_job(aconn, job_id, 1)
+    await claim_job(aconn, job_id, 2)
+    await claim_job(aconn, other_id, 1)
+    assert await complete_job(aconn, job_id, 2, QUESTION, answer) is True
+    assert await complete_job(aconn, job_id, 1, QUESTION, {**answer, "answer": "늦게 끝난 앞 시도"}) is False
+    assert await complete_job(aconn, other_id, 1, CODE_FIX) is True  # 답변이 없는 작업
+    assert conn.execute("SELECT answer FROM jobs WHERE id = %s", (job_id,)).fetchone() == (answer,)
+    assert conn.execute("SELECT answer IS NULL FROM jobs WHERE id = %s", (other_id,)).fetchone() == (True,)  # JSON null 아님

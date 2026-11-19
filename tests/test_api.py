@@ -171,3 +171,34 @@ def test_app_start_creates_checkpoint_and_usage_tables_in_fresh_database(databas
         fresh.execute("SELECT request_type, service, category FROM jobs LIMIT 0")  # 분류 컬럼이 있어야 함
     conn.execute("DROP DATABASE fresh_db WITH (FORCE)")
     assert tables == 4
+
+
+def test_app_start_creates_vector_extension_and_document_tables_in_fresh_database(database_url, redis_url, conn):
+    conn.execute("DROP DATABASE IF EXISTS fresh_rag_db WITH (FORCE)")
+    conn.execute("CREATE DATABASE fresh_rag_db")
+    fresh_url = database_url.rsplit("/", 1)[0] + "/fresh_rag_db"
+    settings = Settings(
+        _env_file=None,
+        database_url=fresh_url,
+        redis_url=redis_url,
+        jobs_api_key=API_KEY,
+        slack_target_channel_ids={"C0TARGET01"},
+        **LLM_SETTINGS,
+    )
+    for _ in range(2):  # 두 번째 시작(이미 다 있음)도 통과해야 함(IF NOT EXISTS, TO-005)
+        with TestClient(create_app(settings)):
+            pass
+    with psycopg.connect(fresh_url) as fresh:
+        extension = fresh.execute("SELECT extversion FROM pg_extension WHERE extname = 'vector'").fetchone()
+        tables = fresh.execute(
+            "SELECT count(*) FROM pg_tables WHERE tablename IN ('documents', 'chunks', 'index_usage')"
+        ).fetchone()[0]
+        column = fresh.execute(
+            "SELECT format_type(atttypid, atttypmod) FROM pg_attribute"
+            " WHERE attrelid = 'chunks'::regclass AND attname = 'embedding'"
+        ).fetchone()[0]
+        fresh.execute("SELECT answer FROM jobs LIMIT 0")  # 답변 컬럼이 있어야 함
+    conn.execute("DROP DATABASE fresh_rag_db WITH (FORCE)")
+    assert extension is not None
+    assert tables == 3
+    assert column == "vector(768)"  # llm.EMBEDDING_DIMS와 같은 값
