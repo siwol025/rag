@@ -7,7 +7,7 @@ from slack_rag import worker
 
 async def two_seconds(ctx, job_id, job_try):
     await asyncio.sleep(2)
-    return OTHER
+    return {"classification": OTHER}
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: postgres:18.6-alpine
+    image: pgvector/pgvector:0.8.7-pg18-trixie   # pgvector 포함(TO-012). tests/conftest.py와 같은 이미지
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -56,6 +56,20 @@ services:
         condition: service_healthy
     restart: unless-stopped          # Redis가 끊기면 워커가 종료됨 → 다시 떠서 대기 작업을 보정(02-queue-worker-plan 3.6)
     stop_grace_period: 70s           # SIGTERM 뒤 실행 중 작업을 최대 60초 기다림(worker.SHUTDOWN_WAIT_S, 3.6)
+
+  indexer:
+    build: .
+    command: ["python", "-m", "slack_rag.indexer", "--loop"]   # 시작 때 1회, 이후 300초마다(TO-014)
+    init: true                       # 작은 init이 PID 1: docker compose stop의 SIGTERM이 파이썬에 바로 전달됨(04-rag-document-search-plan 3.6)
+    env_file: .env                   # GEMINI_API_KEY, EMBEDDING_MODEL(Settings 필수 키도 여기서)
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    volumes:
+      - ./sample_docs:/app/sample_docs:ro   # 색인 폴더(샘플 전용, 읽기 전용, TO-013). 고치면 최대 5분 뒤 반영
+    depends_on:
+      api:
+        condition: service_started   # 확장·표는 api가 시작하며 적용(먼저 돌면 그 회차만 실패 로그)
+    restart: unless-stopped
 
   n8n:
     image: n8nio/n8n:2.47.4

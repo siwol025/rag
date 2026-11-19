@@ -22,11 +22,17 @@ JOB_TIMEOUT_S = 600  # 처리 단계 상한. 분당 한도 대기(최대 약 360
 SHUTDOWN_WAIT_S = 60  # SIGTERM 때 실행 중 작업을 기다리는 시간(3.6). compose stop_grace_period(70s)보다 짧게
 
 
-async def handle_job(ctx: dict[str, Any], job_id: UUID, job_try: int) -> dict[str, str]:
-    """작업의 실제 처리: LangGraph 실행(3.1). 앞선 시도가 끝낸 노드는 체크포인트에서 건너뛴다. 분류를 돌려준다."""
-    context = graph.Context(job_id=job_id, job_try=job_try, db=ctx["db"], llm=ctx["llm"], model=ctx["light_model"])
-    state = await graph.run(ctx["graph"], context)
-    return state["classification"]
+async def handle_job(ctx: dict[str, Any], job_id: UUID, job_try: int) -> dict[str, Any]:
+    """작업의 실제 처리: LangGraph 실행(3.1). 앞선 시도가 끝낸 노드는 체크포인트에서 건너뛴다. 최종 State를 돌려준다."""
+    context = graph.Context(
+        job_id=job_id,
+        job_try=job_try,
+        db=ctx["db"],
+        llm=ctx["llm"],
+        model=ctx["light_model"],
+        embedding_model=ctx["embedding_model"],
+    )
+    return await graph.run(ctx["graph"], context)
 
 
 async def isolate(db: AsyncConnectionPool, job_id: UUID, error: str, fields: dict[str, Any]) -> None:
@@ -60,9 +66,10 @@ async def run_job(ctx: dict[str, Any], job_id: str) -> None:
         logger.info("job_started", extra={"fields": {**fields, "queue_wait_ms": queue_wait_ms}})
         started = time.monotonic()
         async with asyncio.timeout(JOB_TIMEOUT_S):
-            classification = await handle_job(ctx, uid, job_try)
-        async with db.connection() as conn:
-            completed = await complete_job(conn, uid, job_try, classification)
+            state = await handle_job(ctx, uid, job_try)
+        classification = state["classification"]
+        async with db.connection() as conn:  # 답변은 질의응답만(나머지는 None)
+            completed = await complete_job(conn, uid, job_try, classification, state.get("answer"))
     except llm.QuotaExhausted as exc:  # 일일 한도 소진: 초기화 전에는 다시 불러도 거절 → 더 시도하지 않고 격리(3.5)
         await isolate(db, uid, "llm_quota_exhausted", {**fields, "detail": str(exc)})
         return
@@ -86,7 +93,13 @@ def create_worker(settings: Settings, **overrides: Any) -> Worker:
         db = AsyncConnectionPool(settings.database_url, open=False)
         checkpoints = graph.checkpoint_pool(settings.database_url)
         # 연결 전에 넣어 둔다: open이 실패해도 shutdown이 닫을 수 있게(원인 로그가 KeyError에 가려지지 않음)
-        ctx.update(db=db, checkpoints=checkpoints, llm=llm.make_client(settings), light_model=settings.llm_light_model)
+        ctx.update(
+            db=db,
+            checkpoints=checkpoints,
+            llm=llm.make_client(settings),
+            light_model=settings.llm_light_model,
+            embedding_model=settings.embedding_model,
+        )
         await db.open(wait=True)
         await checkpoints.open(wait=True)
         ctx["graph"] = graph.build(checkpoints)
